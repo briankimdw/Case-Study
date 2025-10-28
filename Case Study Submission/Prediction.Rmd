@@ -1,0 +1,406 @@
+---
+title: "Prediction"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document: default
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readr)
+library(vip)
+library(tidymodels)
+library(mgcv)     
+library(rsample)  
+library(yardstick)
+library(broom)    
+library(gratia)   
+library(GGally)
+library(patchwork)
+```
+
+```{r}
+train <- read_csv("data-train.csv")
+
+train <- train %>%
+  mutate(
+    mu    = R_moment_1,
+    sigma = sqrt(pmax(R_moment_2 - R_moment_1^2, 1e-10)),
+    skew  = (R_moment_3 - 3 * R_moment_2 * R_moment_1 + 2 * R_moment_1^3) / sigma^3,
+    kurt  = (R_moment_4 - 4 * R_moment_3 * R_moment_1 + 6 * R_moment_2 * R_moment_1^2 - 3 * R_moment_1^4) / sigma^4
+  ) %>%
+  filter(
+    is.finite(mu), is.finite(sigma), is.finite(skew), is.finite(kurt)
+  ) %>%
+  drop_na(mu, sigma, skew, kurt, Re, Fr, St)
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+train <- read_csv("data-train.csv")
+
+train <- train %>%
+  mutate(
+    # Derived target variables
+    mu    = R_moment_1,
+    sigma = sqrt(pmax(R_moment_2 - R_moment_1^2, 1e-10)),   # avoid sigma = 0
+    skew  = (R_moment_3 - 3 * R_moment_2 * R_moment_1 + 2 * R_moment_1^3) / sigma^3,
+    kurt  = (R_moment_4 - 4 * R_moment_3 * R_moment_1 + 6 * R_moment_2 * R_moment_1^2 - 3 * R_moment_1^4) / sigma^4
+  ) %>%
+  mutate(
+    log_sigma = log(pmax(sigma, 1e-10)),
+    log_skew  = log(pmax(skew, 1e-10)),
+    log_kurt  = log(pmax(kurt, 1e-10)),
+
+    # Safe log-transform for Re
+    logRe = log(pmax(Re, 1e-8)),
+
+    # ✅ Clamp Fr and St to (0, 1) before logit transform
+    Fr = pmin(pmax(Fr, 1e-6), 1 - 1e-6),
+    St = pmin(pmax(St, 1e-6), 1 - 1e-6),
+
+    logitFr = log(Fr / (1 - Fr)),
+    logitSt = log(St / (1 - St))
+  ) %>%
+  # Drop bad rows and ensure all numeric columns are finite
+  filter(
+    is.finite(mu), is.finite(sigma), is.finite(skew), is.finite(kurt),
+    is.finite(logRe), is.finite(logitFr), is.finite(logitSt)
+  ) %>%
+  drop_na(mu, sigma, skew, kurt, logRe, logitFr, logitSt)
+
+
+```
+
+## EDA
+
+
+```{r, message=FALSE, warning=FALSE}
+
+# Summary of predictors and responses
+train %>%
+  select(Re, Fr, St, mu, sigma, skew, kurt) %>%
+  summary()
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#input histograms
+p_inputs <- train %>%
+  select(Re, Fr, St) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = Value, fill = Variable)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~ Variable, scales = "free", nrow = 1) +
+  labs(
+    title = "Distributions of Input Parameters",
+    x = "Value",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold")
+  )
+
+p_inputs
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+#target histograms
+p_targets <- train %>%
+  select(mu, sigma, skew, kurt) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") %>%
+  ggplot(aes(x = Value, fill = Statistic)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~ Statistic, scales = "free", nrow = 2) +
+  labs(
+    title = "Distribution of Target Statistics: μ, σ, γ, κ",
+    x = "Value",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    strip.text = element_text(face = "bold")
+  )
+
+p_targets
+
+```
+```{r, message=FALSE, warning=FALSE}
+#scatterplots
+train %>%
+  select(Re, Fr, St, mu, sigma, skew, kurt) %>%
+  pivot_longer(mu:kurt, names_to="moment", values_to="value") %>%
+  pivot_longer(Re:St, names_to="param", values_to="param_value") %>%
+  ggplot(aes(param_value, value)) +
+  geom_point() +
+  geom_smooth(se=FALSE, color="red") +
+  facet_grid(moment ~ param, scales="free") +
+  theme_minimal()
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+options(ggally.progress = FALSE)
+
+# Pairplot of all predictors and target moments
+train %>%
+  select(Re, Fr, St, mu, sigma, skew, kurt) %>%
+  ggpairs(title = "Pairwise Relationships: Inputs and Output Moments")
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+cors <- train %>% 
+  select(Re, Fr, St, mu, sigma, skew, kurt) %>%
+  cor(use = "complete.obs") %>%
+  round(2)
+
+p_heat <- as_tibble(cors, rownames="var1") %>%
+  pivot_longer(-var1, names_to="var2", values_to="corr") %>%
+  ggplot(aes(var1, var2, fill=corr)) +
+  geom_tile() +
+  geom_text(aes(label=corr), color="white", size=4) +
+  scale_fill_gradient2(limits=c(-1,1), low="blue", mid="white", high="red") +
+  coord_equal() +
+  labs(title="Correlation Heatmap: Inputs vs. Output Moments") +
+  theme_minimal(base_size=12) +
+  theme(
+    plot.title = element_text(face="bold", hjust=0.5),
+    axis.text.x = element_text(angle=45, hjust=1)
+  )
+
+p_heat
+
+```
+
+
+
+
+# GAM
+
+```{r, message=FALSE, warning=FALSE}
+sapply(train[, c("Re", "Fr", "St")], function(x) length(unique(x)))
+```
+
+```{r, message=FALSE, warning=FALSE}
+train_gam <- train %>%
+  mutate(
+    logRe = log(pmax(Re, 1e-8)),
+
+    Fr = pmin(pmax(Fr, 1e-6), 1 - 1e-6),
+    St = pmin(pmax(St, 1e-6), 1 - 1e-6),
+
+    logitFr = log(Fr / (1 - Fr)),
+    logitSt = log(St / (1 - St))
+  ) %>%
+  filter(
+    is.finite(mu), is.finite(sigma), is.finite(skew), is.finite(kurt),
+    is.finite(logRe), is.finite(logitFr), is.finite(logitSt)
+  )
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#for reproducibability
+set.seed(1)
+
+folds <- vfold_cv(train_gam, v = 10)
+
+cv_metrics <- function(formula, data, fit_fun) {
+  map_dfr(folds$splits, function(split) {
+    tr <- analysis(split)
+    va <- assessment(split)
+    
+    fit <- fit_fun(formula, data = tr)
+    
+    preds <- predict(fit, newdata = va)
+    truth <- va[[all.vars(formula)[1]]]
+    
+    tibble(
+      RMSE = rmse_vec(truth = truth, estimate = preds),
+      MAE  = mae_vec(truth = truth, estimate = preds),
+      R2   = rsq_vec(truth = truth, estimate = preds)
+    )
+  }) %>%
+    summarize(across(everything(), mean))
+}
+
+# Define model formulas
+forms <- list(
+  mu    = mu    ~ factor(Re) + logitFr + logitSt,
+  sigma = sigma ~ factor(Re) + logitFr + logitSt,
+  skew  = skew  ~ factor(Re) + logitFr + logitSt,
+  kurt  = kurt  ~ factor(Re) + logitFr + logitSt
+)
+
+gam_forms <- list(
+  mu = mu ~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5),
+  sigma = sigma ~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5),
+  skew = skew ~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5),
+  kurt = kurt ~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5)
+)
+
+# Compute CV metrics for both LM and GAM
+cv_results <- map2_dfr(names(forms), forms, function(name, fml) {
+  lm_metrics <- cv_metrics(fml, train_gam, lm)
+  gam_metrics <- cv_metrics(gam_forms[[name]], train_gam, function(formula, data)
+    gam(formula, data = data, method = "REML"))
+  
+  tibble(
+    Target = name,
+    RMSE_Linear = lm_metrics$RMSE,
+    RMSE_GAM = gam_metrics$RMSE,
+    MAE_Linear = lm_metrics$MAE,
+    MAE_GAM = gam_metrics$MAE,
+    R2_Linear = lm_metrics$R2,
+    R2_GAM = gam_metrics$R2
+  )
+})
+
+cv_results <- cv_results %>%
+  mutate(across(-Target, round, 3))
+
+print(cv_results)
+```
+
+
+
+
+```{r, message=FALSE, warning=FALSE}
+# Fit a GAM for each target
+gam_mu <- gam(mu ~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5), data=train_gam, method="REML")
+gam_sigma <- gam(sigma ~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5), data=train_gam, method="REML")
+gam_skew <- gam(skew~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5), data=train_gam, method="REML")
+gam_kurt <- gam(kurt~ factor(Re) + s(logitFr, k=3) + s(logitSt, k=5), data=train_gam, method="REML")
+
+summary(gam_mu)
+summary(gam_sigma)
+summary(gam_skew)
+summary(gam_kurt)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#linear models
+lm_mu    <- lm(mu~ factor(Re) + logitFr + logitSt, data = train_gam)
+lm_sigma <- lm(sigma~ factor(Re) + logitFr + logitSt, data = train_gam)
+lm_skew  <- lm(skew~ factor(Re) + logitFr + logitSt, data = train_gam)
+lm_kurt  <- lm(kurt~ factor(Re) + logitFr + logitSt, data = train_gam)
+
+summary(lm_mu)
+summary(lm_sigma)
+summary(lm_skew)
+summary(lm_kurt)
+```
+
+
+
+
+```{r, message=FALSE, warning=FALSE}
+#plot smooth plots
+draw(gam_mu)    + ggtitle("Smooth Effect of log(St) on μ")
+draw(gam_sigma) + ggtitle("Smooth Effect of log(St) on σ")
+draw(gam_skew)  + ggtitle("Smooth Effect of log(St) on γ")
+draw(gam_kurt)  + ggtitle("Smooth Effect of log(St) on κ")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# Residual plots
+par(mfrow=c(2,2))
+gam.check(gam_mu)
+gam.check(gam_sigma)
+gam.check(gam_skew)
+gam.check(gam_kurt)
+par(mfrow=c(1,1))
+
+```
+
+
+## Results
+
+```{r, message=FALSE, warning=FALSE}
+test <- read_csv("data-test.csv") %>%
+  mutate(
+    logRe = log(pmax(Re, 1e-8)),
+    Fr = pmin(pmax(Fr, 1e-6), 1 - 1e-6),
+    St = pmin(pmax(St, 1e-6), 1 - 1e-6),
+    logitFr = log(Fr / (1 - Fr)),
+    logitSt = log(St / (1 - St))
+  )
+
+pred_mu    <- predict(gam_mu,    newdata=test, se.fit=TRUE)
+pred_sigma <- predict(gam_sigma, newdata=test, se.fit=TRUE)
+pred_skew  <- predict(gam_skew,  newdata=test, se.fit=TRUE)
+pred_kurt  <- predict(gam_kurt,  newdata=test, se.fit=TRUE)
+
+test_predictions <- tibble(
+  Re = test$Re,
+  Fr = test$Fr,
+  St = test$St,
+  mu_hat    = as.numeric(pred_mu$fit),
+  mu_se     = as.numeric(pred_mu$se.fit),
+  sigma_hat = as.numeric(pred_sigma$fit),
+  sigma_se  = as.numeric(pred_sigma$se.fit),
+  skew_hat  = as.numeric(pred_skew$fit),
+  skew_se   = as.numeric(pred_skew$se.fit),
+  kurt_hat  = as.numeric(pred_kurt$fit),
+  kurt_se   = as.numeric(pred_kurt$se.fit)
+) %>%
+  mutate(
+    mu_lower    = mu_hat - 1.96 * mu_se,
+    mu_upper    = mu_hat + 1.96 * mu_se,
+    sigma_lower = sigma_hat - 1.96 * sigma_se,
+    sigma_upper = sigma_hat + 1.96 * sigma_se,
+    skew_lower  = skew_hat - 1.96 * skew_se,
+    skew_upper  = skew_hat + 1.96 * skew_se,
+    kurt_lower  = kurt_hat - 1.96 * kurt_se,
+    kurt_upper  = kurt_hat + 1.96 * kurt_se
+  )
+
+summary(test_predictions)
+colSums(!is.finite(as.matrix(test_predictions))) 
+
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+submission <- test_predictions %>%
+  select(mu_hat, sigma_hat, skew_hat, kurt_hat)
+
+# Save to CSV (submission-ready)
+write_csv(submission, "predictions.csv")
+
+# Optional: preview to confirm format
+print(head(submission))
+```
+
+```{r}
+# Convert predicted distribution parameters back to raw moments
+submission_rawMoments <- test_predictions %>%
+  mutate(
+    R_moment_1 = mu_hat,
+    R_moment_2 = sigma_hat^2 + mu_hat^2,
+    R_moment_3 = skew_hat * sigma_hat^3 + 3 * sigma_hat^2 * mu_hat + mu_hat^3,
+    R_moment_4 = kurt_hat * sigma_hat^4 + 4 * skew_hat * sigma_hat^3 * mu_hat +
+                 6 * sigma_hat^2 * mu_hat^2 + mu_hat^4
+  ) %>%
+  select(R_moment_1, R_moment_2, R_moment_3, R_moment_4)
+
+write_csv(submission_rawMoments, "predictions_rawMoments.csv")
+
+print(head(submission_rawMoments))
+
+```
+
